@@ -16,7 +16,8 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 import whisper
-import pyautogui
+import ctypes
+from ctypes import wintypes
 from pynput import keyboard
 
 # ---------------------------------------------------------------------------
@@ -172,11 +173,39 @@ def stop_recording_and_transcribe():
 
 
 def type_text(text: str):
-    """Type text into the active window."""
-    try:
-        pyautogui.write(text, interval=0.01)
-    except Exception as e:
-        print(f"[ERROR] Failed to type text: {e}")
+    """Type text into the active window using SendInput for full Unicode support."""
+    KEYEVENTF_UNICODE = 0x0004
+    KEYEVENTF_KEYUP = 0x0002
+    INPUT_KEYBOARD = 1
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", wintypes.WORD),
+            ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    class INPUT(ctypes.Structure):
+        class _INPUT(ctypes.Union):
+            _fields_ = [("ki", KEYBDINPUT)]
+        _anonymous_ = ("_input",)
+        _fields_ = [("type", wintypes.DWORD), ("_input", _INPUT)]
+
+    inputs = []
+    for ch in text:
+        for flags in (KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP):
+            inp = INPUT(type=INPUT_KEYBOARD)
+            inp.ki.wVk = 0
+            inp.ki.wScan = ord(ch)
+            inp.ki.dwFlags = flags
+            inp.ki.time = 0
+            inp.ki.dwExtraInfo = ctypes.pointer(ctypes.c_ulong(0))
+            inputs.append(inp)
+
+    arr = (INPUT * len(inputs))(*inputs)
+    ctypes.windll.user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
 
 
 # ---------------------------------------------------------------------------
