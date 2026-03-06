@@ -16,7 +16,6 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 import whisper
-import pyperclip
 import pyautogui
 from pynput import keyboard
 
@@ -28,6 +27,8 @@ CHANNELS = 1
 WHISPER_MODEL = "large-v3"   # Best for Chinese+English mixing
 HOTKEY_KEY = keyboard.Key.f10
 HOTKEY_MODIFIERS = {keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
+SILENCE_THRESHOLD = 0.01     # RMS below this is considered silence
+SILENCE_CHUNK_MS = 20        # Chunk size in ms for silence detection
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -100,7 +101,27 @@ def start_recording():
             callback=audio_callback,
         )
         stream.start()
-    print("[REC] Recording started — release keys to stop...")
+    print("[REC] Recording started — press Ctrl+F10 to stop...")
+
+
+def trim_silence(audio: np.ndarray) -> np.ndarray:
+    """Remove leading and trailing silence based on RMS energy."""
+    chunk = int(SAMPLE_RATE * SILENCE_CHUNK_MS / 1000)
+    rms = lambda a: np.sqrt(np.mean(a ** 2))
+
+    start = 0
+    while start + chunk < len(audio):
+        if rms(audio[start:start + chunk]) >= SILENCE_THRESHOLD:
+            break
+        start += chunk
+
+    end = len(audio)
+    while end - chunk > start:
+        if rms(audio[end - chunk:end]) >= SILENCE_THRESHOLD:
+            break
+        end -= chunk
+
+    return audio[start:end]
 
 
 def stop_recording_and_transcribe():
@@ -119,6 +140,10 @@ def stop_recording_and_transcribe():
         return
 
     audio_data = np.concatenate(audio_frames, axis=0).flatten()
+    audio_data = trim_silence(audio_data)
+    if len(audio_data) == 0:
+        print("[WARN] Audio is silent after trimming.")
+        return
     duration = len(audio_data) / SAMPLE_RATE
     print(f"[REC] Stopped. Captured {duration:.1f}s of audio. Transcribing...")
 
@@ -147,16 +172,9 @@ def stop_recording_and_transcribe():
 
 
 def type_text(text: str):
-    """Type text into the active window using clipboard paste for reliability with CJK."""
+    """Type text into the active window."""
     try:
-        # Using clipboard + paste is far more reliable than pyautogui.write() for Unicode/CJK
-        original_clipboard = pyperclip.paste()
-        pyperclip.copy(text)
-        time.sleep(0.05)  # Let clipboard settle
-        pyautogui.hotkey("ctrl", "v")
-        time.sleep(0.1)
-        # Optionally restore original clipboard
-        # pyperclip.copy(original_clipboard)
+        pyautogui.write(text, interval=0.01)
     except Exception as e:
         print(f"[ERROR] Failed to type text: {e}")
 
