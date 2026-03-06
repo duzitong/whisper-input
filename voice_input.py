@@ -11,13 +11,15 @@ import os
 import sys
 import queue
 import msvcrt
+import signal
+import tkinter as tk
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 import whisper
-import ctypes
-from ctypes import wintypes
+import pyperclip
+import pyautogui
 from pynput import keyboard
 
 # ---------------------------------------------------------------------------
@@ -30,6 +32,7 @@ HOTKEY_KEY = keyboard.Key.f10
 HOTKEY_MODIFIERS = {keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
 SILENCE_THRESHOLD = 0.01     # RMS below this is considered silence
 SILENCE_CHUNK_MS = 20        # Chunk size in ms for silence detection
+SILENCE_PAD_MS = 200         # Padding to keep around detected speech (ms)
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -40,6 +43,79 @@ record_lock = threading.Lock()
 model = None
 status_queue: queue.Queue = queue.Queue()
 pressed_keys: set = set()
+
+# ---------------------------------------------------------------------------
+# Status indicator overlay
+# ---------------------------------------------------------------------------
+
+STATES = {
+    "idle":         ("IDLE",         "#555555", "white"),
+    "loading":      ("LOADING...",   "#555555", "white"),
+    "recording":    ("RECORDING",    "#cc2222", "white"),
+    "transcribing": ("TRANSCRIBING", "#ccaa00", "black"),
+    "done":         ("DONE",         "#22aa44", "white"),
+}
+
+
+class Indicator:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.overrideredirect(True)       # no title bar
+        self.root.attributes("-topmost", True) # always on top
+        self.root.attributes("-alpha", 0.85)
+
+        self.label = tk.Label(
+            self.root,
+            text="",
+            font=("Segoe UI", 11, "bold"),
+            padx=12, pady=6,
+        )
+        self.label.pack()
+
+        # Position: bottom-right of primary monitor
+        self.root.update_idletasks()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        w = self.root.winfo_reqwidth()
+        h = self.root.winfo_reqheight()
+        self.root.geometry(f"+{sw - w - 20}+{sh - h - 60}")
+
+        self._after_id = None
+        self.set("loading")
+
+    def set(self, state: str):
+        text, bg, fg = STATES[state]
+        self.label.config(text=text, bg=bg, fg=fg)
+        self.root.config(bg=bg)
+        # Refit window to label size
+        self.root.update_idletasks()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        w = self.root.winfo_reqwidth()
+        h = self.root.winfo_reqheight()
+        self.root.geometry(f"+{sw - w - 20}+{sh - h - 60}")
+
+    def set_done_then_idle(self):
+        self.set("done")
+        if self._after_id:
+            self.root.after_cancel(self._after_id)
+        self._after_id = self.root.after(2000, lambda: self.set("idle"))
+
+    def run(self):
+        self.root.mainloop()
+
+
+indicator: Indicator | None = None
+
+
+def set_status(state: str):
+    """Thread-safe status update — schedules onto the tkinter main thread."""
+    if indicator is None:
+        return
+    if state == "done":
+        indicator.root.after(0, indicator.set_done_then_idle)
+    else:
+        indicator.root.after(0, indicator.set, state)
 
 # ---------------------------------------------------------------------------
 # Device selection
@@ -72,7 +148,8 @@ def load_model(device: str):
     print(f"[INFO] Loading Whisper {WHISPER_MODEL} on {device} ...")
     print("[INFO] First run will download the model (~1.5 GB). Please wait.")
     model = whisper.load_model(WHISPER_MODEL, device=device)
-    print(f"[INFO] Model loaded. Ready. Press Ctrl+Alt+Shift+S to start recording.")
+    print(f"[INFO] Model loaded. Ready. Press Ctrl+F10 to start recording.")
+    set_status("idle")
 
 
 # ---------------------------------------------------------------------------
@@ -102,12 +179,14 @@ def start_recording():
             callback=audio_callback,
         )
         stream.start()
+    set_status("recording")
     print("[REC] Recording started — press Ctrl+F10 to stop...")
 
 
 def trim_silence(audio: np.ndarray) -> np.ndarray:
-    """Remove leading and trailing silence based on RMS energy."""
+    """Remove leading and trailing silence, keeping a small pad around speech."""
     chunk = int(SAMPLE_RATE * SILENCE_CHUNK_MS / 1000)
+    pad = int(SAMPLE_RATE * SILENCE_PAD_MS / 1000)
     rms = lambda a: np.sqrt(np.mean(a ** 2))
 
     start = 0
@@ -122,6 +201,8 @@ def trim_silence(audio: np.ndarray) -> np.ndarray:
             break
         end -= chunk
 
+    start = max(0, start - pad)
+    end = min(len(audio), end + pad)
     return audio[start:end]
 
 
@@ -138,15 +219,18 @@ def stop_recording_and_transcribe():
 
     if not audio_frames:
         print("[WARN] No audio captured.")
+        set_status("idle")
         return
 
     audio_data = np.concatenate(audio_frames, axis=0).flatten()
     audio_data = trim_silence(audio_data)
     if len(audio_data) == 0:
         print("[WARN] Audio is silent after trimming.")
+        set_status("idle")
         return
     duration = len(audio_data) / SAMPLE_RATE
     print(f"[REC] Stopped. Captured {duration:.1f}s of audio. Transcribing...")
+    set_status("transcribing")
 
     # Save to temp file
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -164,48 +248,25 @@ def stop_recording_and_transcribe():
         if text:
             print(f"[TEXT] {text}")
             type_text(text)
+            set_status("done")
         else:
             print("[WARN] Transcription returned empty text.")
+            set_status("idle")
     except Exception as e:
         print(f"[ERROR] Transcription failed: {e}")
+        set_status("idle")
     finally:
         os.unlink(tmp_path)
 
 
 def type_text(text: str):
-    """Type text into the active window using SendInput for full Unicode support."""
-    KEYEVENTF_UNICODE = 0x0004
-    KEYEVENTF_KEYUP = 0x0002
-    INPUT_KEYBOARD = 1
-
-    class KEYBDINPUT(ctypes.Structure):
-        _fields_ = [
-            ("wVk", wintypes.WORD),
-            ("wScan", wintypes.WORD),
-            ("dwFlags", wintypes.DWORD),
-            ("time", wintypes.DWORD),
-            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-        ]
-
-    class INPUT(ctypes.Structure):
-        class _INPUT(ctypes.Union):
-            _fields_ = [("ki", KEYBDINPUT)]
-        _anonymous_ = ("_input",)
-        _fields_ = [("type", wintypes.DWORD), ("_input", _INPUT)]
-
-    inputs = []
-    for ch in text:
-        for flags in (KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP):
-            inp = INPUT(type=INPUT_KEYBOARD)
-            inp.ki.wVk = 0
-            inp.ki.wScan = ord(ch)
-            inp.ki.dwFlags = flags
-            inp.ki.time = 0
-            inp.ki.dwExtraInfo = ctypes.pointer(ctypes.c_ulong(0))
-            inputs.append(inp)
-
-    arr = (INPUT * len(inputs))(*inputs)
-    ctypes.windll.user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
+    """Type text into the active window via clipboard paste for Unicode/CJK support."""
+    try:
+        pyperclip.copy(text)
+        time.sleep(0.05)
+        pyautogui.hotkey("ctrl", "v")
+    except Exception as e:
+        print(f"[ERROR] Failed to type text: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -214,11 +275,6 @@ def type_text(text: str):
 
 def on_press(key):
     global recording
-    # Ctrl+C is intercepted by pynput's low-level hook on Windows before the
-    # terminal can raise KeyboardInterrupt — handle it explicitly here.
-    if getattr(key, 'char', None) == '\x03':
-        print("\n[INFO] Exiting.")
-        os._exit(0)
     pressed_keys.add(key)
     ctrl = pressed_keys & HOTKEY_MODIFIERS
     if key == HOTKEY_KEY and ctrl:
@@ -237,6 +293,8 @@ def on_release(key):
 # ---------------------------------------------------------------------------
 
 def main():
+    global indicator
+
     if sys.platform != "win32":
         print("[WARN] This program is designed for Windows.")
 
@@ -251,21 +309,34 @@ def main():
 
     device = select_device()
 
-    # Load model in background so keyboard listener starts immediately
+    indicator = Indicator()
+
     loader_thread = threading.Thread(target=load_model, args=(device,), daemon=True)
     loader_thread.start()
 
     print("[INFO] Starting keyboard listener...")
     print("[INFO] Shortcut: Ctrl+F10 to start recording, Ctrl+F10 again to stop and transcribe")
 
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-            loader_thread.join()  # Wait for model to finish loading before accepting input
-            print("[READY] Listening for hotkey. Press Ctrl+F10 to toggle recording. Press Ctrl+C to quit.")
-            try:
-                listener.join()
-            except KeyboardInterrupt:
-                print("\n[INFO] Exiting.")
-                listener.stop()
+    def run_listener():
+        loader_thread.join()
+        print("[READY] Listening for hotkey. Press Ctrl+F10 to toggle recording. Press Ctrl+C to quit.")
+        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+            listener.join()
+        indicator.root.after(0, indicator.root.destroy)
+
+    def handle_sigint(sig, frame):
+        print("\n[INFO] Exiting.")
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    # Tkinter on Windows blocks signal delivery unless we periodically yield.
+    def poll_signals():
+        indicator.root.after(200, poll_signals)
+
+    threading.Thread(target=run_listener, daemon=True).start()
+    indicator.root.after(200, poll_signals)
+    indicator.run()  # tkinter mainloop on main thread
 
 
 if __name__ == "__main__":
