@@ -255,14 +255,10 @@ def stop_recording_and_transcribe():
     print(f"[REC] Stopped. Captured {duration:.1f}s of audio. Transcribing...")
     set_status("transcribing")
 
-    # Save to temp file
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        tmp_path = f.name
-    sf.write(tmp_path, audio_data, SAMPLE_RATE)
-
+    # Pass numpy array directly — no temp file, no ffmpeg dependency.
     try:
         result = model.transcribe(
-            tmp_path,
+            audio_data,
             language=None,       # auto-detect; handles mixed Chinese+English
             task="transcribe",
             fp16=False,          # fp16 only safe on CUDA; CPU needs fp32
@@ -278,8 +274,6 @@ def stop_recording_and_transcribe():
     except Exception as e:
         print(f"[ERROR] Transcription failed: {e}")
         set_status("idle")
-    finally:
-        os.unlink(tmp_path)
 
 
 def type_text(text: str):
