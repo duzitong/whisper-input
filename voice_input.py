@@ -34,6 +34,11 @@ SILENCE_THRESHOLD = 0.01     # RMS below this is considered silence
 SILENCE_CHUNK_MS = 20        # Chunk size in ms for silence detection
 SILENCE_PAD_MS = 200         # Padding to keep around detected speech (ms)
 
+# Optional HTTP/HTTPS proxy for downloading the Whisper model.
+# Examples: "http://127.0.0.1:7890"  or  "http://user:pass@proxy.corp:8080"
+# Leave empty string "" to use no proxy (direct connection).
+PROXY = ""
+
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
@@ -147,7 +152,25 @@ def load_model(device: str):
     global model
     print(f"[INFO] Loading Whisper {WHISPER_MODEL} on {device} ...")
     print("[INFO] First run will download the model (~1.5 GB). Please wait.")
-    model = whisper.load_model(WHISPER_MODEL, device=device)
+
+    # Apply proxy settings for the model download if configured.
+    _proxy_keys = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
+    _saved_env: dict[str, str | None] = {}
+    if PROXY:
+        print(f"[INFO] Using proxy for model download: {PROXY}")
+        for _k in _proxy_keys:
+            _saved_env[_k] = os.environ.get(_k)
+            os.environ[_k] = PROXY
+    try:
+        model = whisper.load_model(WHISPER_MODEL, device=device)
+    finally:
+        if PROXY:
+            for _k, _v in _saved_env.items():
+                if _v is None:
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _v
+
     print(f"[INFO] Model loaded. Ready. Press Ctrl+F10 to start recording.")
     set_status("idle")
 
