@@ -1,6 +1,6 @@
 """
 Voice input program triggered by Ctrl+Alt+Shift+S.
-Hold the shortcut to record, release to transcribe and type into the active window.
+Hold the hotkey to record, release to transcribe and type into the active window.
 Uses OpenAI Whisper (local) for Chinese+English mixed speech recognition.
 """
 
@@ -171,7 +171,7 @@ def load_model(device: str):
                 else:
                     os.environ[_k] = _v
 
-    print(f"[INFO] Model loaded. Ready. Press Ctrl+F10 to start recording.")
+    print(f"[INFO] Model loaded. Ready. Hold Ctrl+F10 to record, release to transcribe.")
     set_status("idle")
 
 
@@ -203,7 +203,7 @@ def start_recording():
         )
         stream.start()
     set_status("recording")
-    print("[REC] Recording started — press Ctrl+F10 to stop...")
+    print("[REC] Recording started — release Ctrl+F10 to stop...")
 
 
 def trim_silence(audio: np.ndarray) -> np.ndarray:
@@ -291,18 +291,16 @@ def type_text(text: str):
 # ---------------------------------------------------------------------------
 
 def on_press(key):
-    global recording
     pressed_keys.add(key)
     ctrl = pressed_keys & HOTKEY_MODIFIERS
-    if key == HOTKEY_KEY and ctrl:
-        if not recording:
-            start_recording()
-        else:
-            threading.Thread(target=stop_recording_and_transcribe, daemon=True).start()
+    if key == HOTKEY_KEY and ctrl and not recording:
+        start_recording()
 
 
 def on_release(key):
     pressed_keys.discard(key)
+    if key == HOTKEY_KEY and recording:
+        threading.Thread(target=stop_recording_and_transcribe, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -332,11 +330,11 @@ def main():
     loader_thread.start()
 
     print("[INFO] Starting keyboard listener...")
-    print("[INFO] Shortcut: Ctrl+F10 to start recording, Ctrl+F10 again to stop and transcribe")
+    print("[INFO] Shortcut: Hold Ctrl+F10 to record, release to transcribe")
 
     def run_listener():
         loader_thread.join()
-        print("[READY] Listening for hotkey. Press Ctrl+F10 to toggle recording. Press Ctrl+C to quit.")
+        print("[READY] Listening for hotkey. Hold Ctrl+F10 to record. Press Ctrl+C to quit.")
         with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
             listener.join()
         indicator.root.after(0, indicator.root.destroy)
