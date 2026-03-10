@@ -92,6 +92,7 @@ class Indicator:
         text, bg, fg = STATES[state]
         self.label.config(text=text, bg=bg, fg=fg)
         self.root.config(bg=bg)
+        self.root.attributes("-topmost", True)
         # Refit window to label size
         self.root.update_idletasks()
         sw = self.root.winfo_screenwidth()
